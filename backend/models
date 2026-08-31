@@ -1,0 +1,57 @@
+"""
+ORM models: Learner profile, chat history, and course progress tracking.
+"""
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey, JSON
+from sqlalchemy.orm import relationship
+
+from database import Base
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+class Learner(Base):
+    __tablename__ = "learners"
+
+    id = Column(String, primary_key=True)  # e.g. learner_ab12cd
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    # Structured profile fields
+    goal = Column(Text, default="")
+    interests = Column(JSON, default=list)          # list[str]
+    experience_level = Column(String, default="beginner")  # beginner/intermediate/advanced
+    completed_course_ids = Column(JSON, default=list)  # list[str] (self-reported prior courses)
+    weekly_hours = Column(Integer, default=5)
+    raw_profile_notes = Column(Text, default="")     # free-text extra context from chat
+
+    chat_messages = relationship("ChatMessage", back_populates="learner", cascade="all, delete-orphan")
+    progress_records = relationship("Progress", back_populates="learner", cascade="all, delete-orphan")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    learner_id = Column(String, ForeignKey("learners.id"), nullable=False)
+    role = Column(String, nullable=False)  # 'user' | 'assistant'
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+    learner = relationship("Learner", back_populates="chat_messages")
+
+
+class Progress(Base):
+    __tablename__ = "progress"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    learner_id = Column(String, ForeignKey("learners.id"), nullable=False)
+    course_id = Column(String, nullable=False)
+    status = Column(String, default="not_started")  # not_started | in_progress | completed
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+    learner = relationship("Learner", back_populates="progress_records")
