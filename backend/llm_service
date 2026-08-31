@@ -1,0 +1,158 @@
+"""
+LLM service layer: wraps the Groq API (OpenAI-compatible) for three jobs:
+  1. Extracting/updating a structured learner profile from free-text chat.
+  2. Explaining why a specific course was recommended.
+  3. Answering free-form learner questions about their path.
+
+Requires GROQ_API_KEY to be set in the environment (see .env.example).
+Get a free key at https://console.groq.com/keys -- no credit card required.
+"""
+import json
+import os
+from typing import Any, Dict, List
+
+from groq import Groq
+
+_client = None
+
+MODEL = "openai/gpt-oss-120b"
+
+
+def get_client() -> Groq:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. Copy .env.example to .env and add your key "
+                "(get one free at https://console.groq.com/keys)."
+            )
+        _client = Groq(api_key=api_key)
+    return _client
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    """Best-effort extraction of a JSON object from a model response."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return {}
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+
+PROFILE_EXTRACTION_SYSTEM = """You are a learner-profiling assistant for an AI-powered learning path recommender.
+
+Given the conversation so far and the learner's latest message, do two things:
+1. Write a short, warm, helpful conversational reply (1-4 sentences) that keeps the conversation
+   moving -- acknowledge what they said, and if key info is still missing (goal, interests,
+   experience level, or time commitment), ask ONE clear follow-up question.
+2. Extract any profile fields you can confidently infer from the ENTIRE conversation
+   (not just the latest message) into structured JSON.
+
+Respond with ONLY a JSON object, no preamble, no markdown fences, in this exact shape:
+{
+  "reply": "<your conversational reply>",
+  "profile_updates": {
+    "goal": "<string or null if unknown>",
+    "interests": ["<string>", "..."] or null,
+    "experience_level": "beginner" | "intermediate" | "advanced" | null,
+    "weekly_hours": <integer or null>,
+    "notes": "<any other useful free-text context, or null>"
+  }
+}
+
+Only include a field in profile_updates if you can infer it; use null for anything unknown.
+Never invent specifics the learner didn't imply.
+"""
+
+
+def process_chat_turn(
+    conversation_history: List[Dict[str, str]],
+    latest_message: str,
+    current_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Sends the conversation to Groq (Llama) and returns:
+      {"reply": str, "profile_updates": {...}}
+    """
+    client = get_client()
+
+    context_msg = (
+        f"Current known profile: {json.dumps(current_profile)}\n\n"
+        f"Learner's latest message: {latest_message}"
+    )
+
+    messages = [{"role": "system", "content": PROFILE_EXTRACTION_SYSTEM}]
+    for turn in conversation_history[-10:]:  # keep last 10 turns for context window sanity
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": context_msg})
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=500,
+        messages=messages,
+    )
+    text = response.choices[0].message.content
+    parsed = _extract_json(text)
+    if not parsed:
+        # Fallback: treat entire response as the reply, no profile updates
+        return {"reply": text.strip() or "Could you tell me a bit more about your learning goals?",
+                "profile_updates": {}}
+    return {
+        "reply": parsed.get("reply", "").strip() or "Tell me more about what you'd like to learn.",
+        "profile_updates": parsed.get("profile_updates", {}) or {},
+    }
+
+
+def generate_explanation(learner_profile: Dict[str, Any], course: Dict[str, Any]) -> str:
+    """Generate a grounded, specific explanation for why a course was recommended."""
+    client = get_client()
+    prompt = f"""A learner has this profile:
+{json.dumps(learner_profile, indent=2)}
+
+We are recommending them this course:
+{json.dumps(course, indent=2)}
+
+In 2-3 sentences, explain specifically why this course fits THIS learner's stated goal,
+interests, and experience level. Reference their actual goal/interests by name. Be concrete,
+not generic. Do not use bullet points."""
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def answer_learner_query(
+    learner_profile: Dict[str, Any],
+    path_summary: Dict[str, Any],
+    question: str,
+) -> str:
+    """Answer a free-form learner question grounded in their profile and current path."""
+    client = get_client()
+    prompt = f"""Learner profile:
+{json.dumps(learner_profile, indent=2)}
+
+Their current learning path (milestones and courses):
+{json.dumps(path_summary, indent=2)}
+
+Learner's question: "{question}"
+
+Answer helpfully and concisely (max ~120 words), grounded in the actual path and profile above.
+If the question can't be answered from this data, say so honestly and suggest what info
+would help."""
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=350,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content.strip()
