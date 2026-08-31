@@ -1,0 +1,291 @@
+"""
+FastAPI backend for the AI-Powered Personalized Learning Path Recommender.
+
+Endpoints:
+  POST /learners                          -- create a learner profile
+  GET  /learners/{learner_id}              -- fetch a learner profile
+  PATCH /learners/{learner_id}             -- manually update profile fields
+  POST /chat                               -- conversational intake (Claude-powered)
+  GET  /recommendations/{learner_id}       -- ranked course recommendations
+  GET  /path/{learner_id}                  -- structured milestone-based learning path
+  POST /explain                            -- why was this course recommended
+  POST /query                              -- ask the AI assistant a free-form question
+  POST /progress                           -- mark a course's progress status
+  GET  /dashboard/{learner_id}             -- aggregated progress + skill stats
+"""
+import uuid
+from typing import List
+
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from database import Base, engine, get_db
+import models
+import schemas
+import llm_service
+from recommendation import recommend_courses, load_courses
+from path_generator import generate_path
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Personalized Learning Path Recommender API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------- helpers ----------
+
+def _learner_to_profile_dict(learner: models.Learner) -> dict:
+    return {
+        "name": learner.name,
+        "goal": learner.goal,
+        "interests": learner.interests or [],
+        "experience_level": learner.experience_level,
+        "completed_course_ids": learner.completed_course_ids or [],
+        "weekly_hours": learner.weekly_hours,
+        "notes": learner.raw_profile_notes,
+    }
+
+
+def _get_learner_or_404(db: Session, learner_id: str) -> models.Learner:
+    learner = db.query(models.Learner).filter(models.Learner.id == learner_id).first()
+    if not learner:
+        raise HTTPException(status_code=404, detail="Learner not found")
+    return learner
+
+
+# ---------- learner profile ----------
+
+@app.post("/learners", response_model=schemas.LearnerOut)
+def create_learner(payload: schemas.LearnerCreate, db: Session = Depends(get_db)):
+    learner_id = f"learner_{uuid.uuid4().hex[:8]}"
+    learner = models.Learner(
+        id=learner_id,
+        name=payload.name,
+        email=payload.email,
+        goal=payload.goal,
+        interests=payload.interests,
+        experience_level=payload.experience_level,
+        completed_course_ids=payload.completed_course_ids,
+        weekly_hours=payload.weekly_hours,
+    )
+    db.add(learner)
+    db.commit()
+    db.refresh(learner)
+    return learner
+
+
+@app.get("/learners/{learner_id}", response_model=schemas.LearnerOut)
+def get_learner(learner_id: str, db: Session = Depends(get_db)):
+    return _get_learner_or_404(db, learner_id)
+
+
+@app.patch("/learners/{learner_id}", response_model=schemas.LearnerOut)
+def update_learner(learner_id: str, payload: schemas.LearnerUpdate, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, learner_id)
+    for field, value in payload.dict(exclude_unset=True).items():
+        setattr(learner, field, value)
+    db.commit()
+    db.refresh(learner)
+    return learner
+
+
+# ---------- conversational intake ----------
+
+@app.post("/chat", response_model=schemas.ChatResponse)
+def chat(payload: schemas.ChatRequest, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, payload.learner_id)
+
+    history = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.learner_id == learner.id)
+        .order_by(models.ChatMessage.id.asc())
+        .all()
+    )
+    conversation = [{"role": m.role, "content": m.content} for m in history]
+
+    result = llm_service.process_chat_turn(
+        conversation_history=conversation,
+        latest_message=payload.message,
+        current_profile=_learner_to_profile_dict(learner),
+    )
+
+    # persist chat turn
+    db.add(models.ChatMessage(learner_id=learner.id, role="user", content=payload.message))
+    db.add(models.ChatMessage(learner_id=learner.id, role="assistant", content=result["reply"]))
+
+    # apply any extracted profile updates
+    updated_fields: List[str] = []
+    updates = result.get("profile_updates", {}) or {}
+    if updates.get("goal"):
+        learner.goal = updates["goal"]
+        updated_fields.append("goal")
+    if updates.get("interests"):
+        merged = list({*(learner.interests or []), *updates["interests"]})
+        learner.interests = merged
+        updated_fields.append("interests")
+    if updates.get("experience_level"):
+        learner.experience_level = updates["experience_level"]
+        updated_fields.append("experience_level")
+    if updates.get("weekly_hours"):
+        try:
+            learner.weekly_hours = int(updates["weekly_hours"])
+            updated_fields.append("weekly_hours")
+        except (TypeError, ValueError):
+            pass
+    if updates.get("notes"):
+        learner.raw_profile_notes = (learner.raw_profile_notes or "") + "\n" + updates["notes"]
+        updated_fields.append("raw_profile_notes")
+
+    db.commit()
+    db.refresh(learner)
+
+    return schemas.ChatResponse(
+        reply=result["reply"],
+        updated_profile=learner,
+        profile_fields_updated=updated_fields,
+    )
+
+
+# ---------- recommendations & path ----------
+
+@app.get("/recommendations/{learner_id}", response_model=List[schemas.RecommendationItem])
+def get_recommendations(learner_id: str, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, learner_id)
+    profile = _learner_to_profile_dict(learner)
+    ranked = recommend_courses(profile, top_k=12)
+    return [
+        schemas.RecommendationItem(course=item["course"], score=item["score"])
+        for item in ranked
+    ]
+
+
+@app.get("/path/{learner_id}", response_model=schemas.LearningPathOut)
+def get_path(learner_id: str, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, learner_id)
+    profile = _learner_to_profile_dict(learner)
+    ranked = recommend_courses(profile, top_k=12)
+    path = generate_path(ranked, profile["completed_course_ids"], max_courses=8)
+
+    weekly_hours = max(profile.get("weekly_hours") or 5, 1)
+    estimated_weeks = round(path["total_hours"] / weekly_hours, 1) if path["total_hours"] else 0.0
+
+    return schemas.LearningPathOut(
+        learner_id=learner_id,
+        milestones=path["milestones"],
+        total_courses=path["total_courses"],
+        total_hours=path["total_hours"],
+        estimated_weeks=estimated_weeks,
+    )
+
+
+# ---------- explainability & Q&A ----------
+
+@app.post("/explain")
+def explain_course(payload: schemas.ExplainRequest, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, payload.learner_id)
+    courses = {c["id"]: c for c in load_courses()}
+    course = courses.get(payload.course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+    explanation = llm_service.generate_explanation(_learner_to_profile_dict(learner), course)
+    return {"course_id": payload.course_id, "explanation": explanation}
+
+
+@app.post("/query")
+def query_assistant(payload: schemas.QueryRequest, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, payload.learner_id)
+    profile = _learner_to_profile_dict(learner)
+    ranked = recommend_courses(profile, top_k=12)
+    path = generate_path(ranked, profile["completed_course_ids"], max_courses=8)
+    path_summary = {
+        "milestones": [
+            {"title": m["title"], "courses": [c["title"] for c in m["courses"]]}
+            for m in path["milestones"]
+        ]
+    }
+    answer = llm_service.answer_learner_query(profile, path_summary, payload.question)
+    return {"answer": answer}
+
+
+# ---------- progress & dashboard ----------
+
+@app.post("/progress")
+def update_progress(payload: schemas.ProgressUpdate, db: Session = Depends(get_db)):
+    _get_learner_or_404(db, payload.learner_id)
+    record = (
+        db.query(models.Progress)
+        .filter(models.Progress.learner_id == payload.learner_id, models.Progress.course_id == payload.course_id)
+        .first()
+    )
+    if record:
+        record.status = payload.status
+    else:
+        record = models.Progress(learner_id=payload.learner_id, course_id=payload.course_id, status=payload.status)
+        db.add(record)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/dashboard/{learner_id}", response_model=schemas.DashboardOut)
+def get_dashboard(learner_id: str, db: Session = Depends(get_db)):
+    learner = _get_learner_or_404(db, learner_id)
+    profile = _learner_to_profile_dict(learner)
+
+    ranked = recommend_courses(profile, top_k=12)
+    path = generate_path(ranked, profile["completed_course_ids"], max_courses=8)
+    all_path_course_ids = {c["id"]: c for m in path["milestones"] for c in m["courses"]}
+
+    progress_records = db.query(models.Progress).filter(models.Progress.learner_id == learner_id).all()
+    status_by_course = {p.course_id: p.status for p in progress_records}
+
+    completed = sum(1 for cid in all_path_course_ids if status_by_course.get(cid) == "completed")
+    in_progress = sum(1 for cid in all_path_course_ids if status_by_course.get(cid) == "in_progress")
+    total = len(all_path_course_ids)
+    not_started = total - completed - in_progress
+
+    hours_completed = sum(
+        c["duration_hours"] for cid, c in all_path_course_ids.items()
+        if status_by_course.get(cid) == "completed"
+    )
+
+    skill_categories = {}
+    for cid, c in all_path_course_ids.items():
+        cat = c["category"]
+        skill_categories.setdefault(cat, {"total": 0, "completed": 0})
+        skill_categories[cat]["total"] += 1
+        if status_by_course.get(cid) == "completed":
+            skill_categories[cat]["completed"] += 1
+
+    next_recommended = [
+        c for cid, c in all_path_course_ids.items()
+        if status_by_course.get(cid, "not_started") == "not_started"
+    ][:5]
+
+    return schemas.DashboardOut(
+        learner_id=learner_id,
+        total_recommended=total,
+        completed=completed,
+        in_progress=in_progress,
+        not_started=not_started,
+        completion_pct=round(100 * completed / total, 1) if total else 0.0,
+        hours_completed=hours_completed,
+        skill_categories=skill_categories,
+        next_recommended=next_recommended,
+    )
+
+
+@app.get("/courses", response_model=List[schemas.CourseOut])
+def list_courses():
+    return load_courses()
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Personalized Learning Path Recommender API"}
