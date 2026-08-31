@@ -1,0 +1,127 @@
+"""
+Learning path generator.
+
+Takes a ranked list of recommended courses, pulls in any missing prerequisite
+courses from the full catalog, and produces a topologically-sorted, milestone-
+grouped roadmap. Milestones are formed by "graph depth" (how many prerequisite
+hops deep a course sits), so foundational courses always appear before the
+things that depend on them -- even if the recommender didn't rank them first.
+"""
+from collections import deque
+from typing import Any, Dict, List
+
+from recommendation import load_courses
+
+MILESTONE_NAMES = ["Foundations", "Core Skills", "Applied Practice", "Advanced & Capstone"]
+
+
+def _build_course_set_with_prereqs(recommended_ids: List[str], all_courses_by_id: Dict[str, Any]) -> set:
+    """Expand recommended course IDs to include all transitive prerequisites."""
+    included = set()
+    queue = deque(recommended_ids)
+    while queue:
+        cid = queue.popleft()
+        if cid in included or cid not in all_courses_by_id:
+            continue
+        included.add(cid)
+        for prereq_id in all_courses_by_id[cid].get("prerequisites", []):
+            if prereq_id not in included:
+                queue.append(prereq_id)
+    return included
+
+
+def _compute_depths(course_ids: set, all_courses_by_id: Dict[str, Any]) -> Dict[str, int]:
+    """Depth = length of the longest prerequisite chain leading to this course."""
+    depth_cache: Dict[str, int] = {}
+
+    def depth_of(cid: str, visiting: set) -> int:
+        if cid in depth_cache:
+            return depth_cache[cid]
+        if cid in visiting:
+            return 0  # guard against cyclic data
+        course = all_courses_by_id.get(cid)
+        if not course or not course.get("prerequisites"):
+            depth_cache[cid] = 0
+            return 0
+        visiting = visiting | {cid}
+        d = 1 + max(
+            (depth_of(p, visiting) for p in course["prerequisites"] if p in course_ids),
+            default=-1,
+        )
+        depth_cache[cid] = max(d, 0)
+        return depth_cache[cid]
+
+    for cid in course_ids:
+        depth_of(cid, set())
+    return depth_cache
+
+
+def generate_path(
+    recommended: List[Dict[str, Any]],
+    completed_course_ids: List[str],
+    max_courses: int = 10,
+) -> Dict[str, Any]:
+    """
+    recommended: output of recommendation.recommend_courses() -- list of {course, score}
+    Returns a dict: {milestones: [...], total_courses, total_hours, estimated_weeks}
+    """
+    all_courses = load_courses()
+    all_courses_by_id = {c["id"]: c for c in all_courses}
+    completed = set(completed_course_ids or [])
+
+    # Only use courses with genuine relevance signal as path anchors -- otherwise
+    # zero-similarity "padding" from the recommender (returned so the UI can still
+    # show a full list) would get pulled into the roadmap as if it were relevant.
+    relevant = [r for r in recommended if r["score"] > 0.05]
+    anchors = relevant if relevant else recommended  # fall back if no signal at all yet
+    top_recommended_ids = [r["course"]["id"] for r in anchors[:max_courses]]
+    full_id_set = _build_course_set_with_prereqs(top_recommended_ids, all_courses_by_id)
+    full_id_set -= completed  # don't re-teach what they already know
+
+    if not full_id_set:
+        return {"milestones": [], "total_courses": 0, "total_hours": 0, "estimated_weeks": 0.0}
+
+    depths = _compute_depths(full_id_set, all_courses_by_id)
+    max_depth = max(depths.values()) if depths else 0
+
+    # Map depth -> milestone bucket (cap at 4 milestone buckets for readability)
+    num_buckets = min(max_depth + 1, len(MILESTONE_NAMES))
+
+    def bucket_for_depth(d: int) -> int:
+        if max_depth == 0:
+            return 0
+        return min(round(d / max_depth * (num_buckets - 1)), num_buckets - 1)
+
+    buckets: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(num_buckets)}
+    for cid in full_id_set:
+        b = bucket_for_depth(depths[cid])
+        buckets[b].append(all_courses_by_id[cid])
+
+    # Sort courses within each milestone by difficulty then title for stable, sensible ordering
+    diff_rank = {"beginner": 0, "intermediate": 1, "advanced": 2}
+    for b in buckets:
+        buckets[b].sort(key=lambda c: (diff_rank.get(c["difficulty"], 1), c["title"]))
+
+    milestones = []
+    total_hours = 0
+    total_courses = 0
+    for i in range(num_buckets):
+        courses = buckets[i]
+        if not courses:
+            continue
+        hours = sum(c["duration_hours"] for c in courses)
+        total_hours += hours
+        total_courses += len(courses)
+        milestones.append({
+            "milestone_number": len(milestones) + 1,
+            "title": MILESTONE_NAMES[i] if i < len(MILESTONE_NAMES) else f"Milestone {i + 1}",
+            "courses": courses,
+            "total_hours": hours,
+        })
+
+    return {
+        "milestones": milestones,
+        "total_courses": total_courses,
+        "total_hours": total_hours,
+        "estimated_weeks": 0.0,  # filled in by caller once weekly_hours is known
+    }
