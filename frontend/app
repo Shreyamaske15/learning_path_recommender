@@ -1,0 +1,233 @@
+"""
+Streamlit frontend for the AI-Powered Personalized Learning Path Recommender.
+
+Talks to the FastAPI backend over HTTP. Run the backend first (see README),
+then launch this with: streamlit run frontend/app.py
+"""
+import os
+import requests
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+
+API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000")
+
+st.set_page_config(page_title="AI Learning Path Recommender", page_icon="🎓", layout="wide")
+
+
+# ---------------- session state ----------------
+
+if "learner_id" not in st.session_state:
+    st.session_state.learner_id = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # list of {role, content} for display
+
+
+def api_get(path, **kwargs):
+    r = requests.get(f"{API_BASE}{path}", **kwargs)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_post(path, json_body):
+    r = requests.post(f"{API_BASE}{path}", json=json_body)
+    if not r.ok:
+        st.error(f"API error ({r.status_code}): {r.text}")
+        r.raise_for_status()
+    return r.json()
+
+
+def api_patch(path, json_body):
+    r = requests.patch(f"{API_BASE}{path}", json=json_body)
+    r.raise_for_status()
+    return r.json()
+
+
+# ---------------- sidebar: learner setup ----------------
+
+st.sidebar.title("🎓 Learner Setup")
+
+if st.session_state.learner_id is None:
+    st.sidebar.write("Create your learner profile to get started.")
+    with st.sidebar.form("create_learner_form"):
+        name = st.text_input("Name", value="Guest Learner")
+        experience_level = st.selectbox("Experience level", ["beginner", "intermediate", "advanced"])
+        weekly_hours = st.slider("Hours you can study per week", 1, 30, 5)
+        submitted = st.form_submit_button("Start")
+        if submitted:
+            try:
+                learner = api_post("/learners", {
+                    "name": name,
+                    "experience_level": experience_level,
+                    "weekly_hours": weekly_hours,
+                })
+                st.session_state.learner_id = learner["id"]
+                st.rerun()
+            except requests.exceptions.ConnectionError:
+                st.error("Can't reach the backend API. Is `uvicorn main:app` running on port 8000?")
+else:
+    st.sidebar.success(f"Learner ID: `{st.session_state.learner_id}`")
+    if st.sidebar.button("Reset / new learner"):
+        st.session_state.learner_id = None
+        st.session_state.chat_history = []
+        st.rerun()
+
+    try:
+        profile = api_get(f"/learners/{st.session_state.learner_id}")
+        st.sidebar.markdown("### Current Profile")
+        st.sidebar.write(f"**Goal:** {profile['goal'] or '_not set yet_'}")
+        st.sidebar.write(f"**Interests:** {', '.join(profile['interests']) or '_none yet_'}")
+        st.sidebar.write(f"**Level:** {profile['experience_level']}")
+        st.sidebar.write(f"**Weekly hours:** {profile['weekly_hours']}")
+    except requests.exceptions.HTTPError:
+        st.sidebar.warning("Profile not found -- resetting.")
+        st.session_state.learner_id = None
+
+
+st.title("AI-Powered Personalized Learning Path Recommender")
+
+if st.session_state.learner_id is None:
+    st.info("👈 Create a learner profile in the sidebar to begin.")
+    st.stop()
+
+tab_chat, tab_path, tab_dashboard, tab_ask = st.tabs(
+    ["💬 Chat & Profile", "🗺️ Learning Path", "📊 Dashboard", "❓ Ask the Assistant"]
+)
+
+
+# ---------------- Tab 1: Chat ----------------
+
+with tab_chat:
+    st.subheader("Tell me about your learning goals")
+    st.caption(
+        "Describe what you want to learn, why, and your background. "
+        "I'll build and refine your profile as we talk."
+    )
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    user_input = st.chat_input("e.g. I want to become a machine learning engineer within 6 months...")
+    if user_input:
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.write(user_input)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    result = api_post("/chat", {
+                        "learner_id": st.session_state.learner_id,
+                        "message": user_input,
+                    })
+                    st.write(result["reply"])
+                    if result["profile_fields_updated"]:
+                        st.caption(f"✅ Updated: {', '.join(result['profile_fields_updated'])}")
+                    st.session_state.chat_history.append({"role": "assistant", "content": result["reply"]})
+                except requests.exceptions.HTTPError as e:
+                    st.error(f"Something went wrong: {e}")
+
+
+# ---------------- Tab 2: Learning Path ----------------
+
+with tab_path:
+    st.subheader("Your Personalized Roadmap")
+    if st.button("🔄 Generate / refresh path"):
+        st.session_state.pop("path_cache", None)
+
+    if "path_cache" not in st.session_state:
+        try:
+            st.session_state.path_cache = api_get(f"/path/{st.session_state.learner_id}")
+        except requests.exceptions.HTTPError:
+            st.error("Could not generate a path yet. Chat a bit more about your goals first.")
+            st.session_state.path_cache = None
+
+    path = st.session_state.get("path_cache")
+    if path and path["milestones"]:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total courses", path["total_courses"])
+        c2.metric("Total hours", path["total_hours"])
+        c3.metric("Estimated weeks", path["estimated_weeks"])
+
+        for milestone in path["milestones"]:
+            st.markdown(f"### Milestone {milestone['milestone_number']}: {milestone['title']}")
+            st.caption(f"{len(milestone['courses'])} courses · {milestone['total_hours']} hours")
+            for course in milestone["courses"]:
+                with st.expander(f"📘 {course['title']}  ·  {course['difficulty'].capitalize()}  ·  {course['duration_hours']}h"):
+                    st.write(course["description"])
+                    st.caption(f"Tags: {', '.join(course['tags'])}")
+                    col_a, col_b = st.columns([1, 3])
+                    with col_a:
+                        if st.button("Why this course?", key=f"explain_{course['id']}"):
+                            with st.spinner("Asking the AI assistant..."):
+                                exp = api_post("/explain", {
+                                    "learner_id": st.session_state.learner_id,
+                                    "course_id": course["id"],
+                                })
+                                st.info(exp["explanation"])
+                    with col_b:
+                        status = st.selectbox(
+                            "Progress",
+                            ["not_started", "in_progress", "completed"],
+                            key=f"status_{course['id']}",
+                            label_visibility="collapsed",
+                        )
+                        if st.button("Update", key=f"update_{course['id']}"):
+                            api_post("/progress", {
+                                "learner_id": st.session_state.learner_id,
+                                "course_id": course["id"],
+                                "status": status,
+                            })
+                            st.success("Progress updated!")
+    else:
+        st.info("Chat about your goals in the first tab, then come back to generate your path.")
+
+
+# ---------------- Tab 3: Dashboard ----------------
+
+with tab_dashboard:
+    st.subheader("Progress Dashboard")
+    try:
+        dash = api_get(f"/dashboard/{st.session_state.learner_id}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Completion", f"{dash['completion_pct']}%")
+        c2.metric("Completed", dash["completed"])
+        c3.metric("In progress", dash["in_progress"])
+        c4.metric("Hours completed", dash["hours_completed"])
+
+        if dash["skill_categories"]:
+            df = pd.DataFrame([
+                {"Category": cat, "Completed": v["completed"], "Remaining": v["total"] - v["completed"]}
+                for cat, v in dash["skill_categories"].items()
+            ])
+            df_melted = df.melt(id_vars="Category", var_name="Status", value_name="Courses")
+            fig = px.bar(
+                df_melted, x="Category", y="Courses", color="Status", barmode="stack",
+                title="Skill Development by Category",
+                color_discrete_map={"Completed": "#4CAF50", "Remaining": "#E0E0E0"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        if dash["next_recommended"]:
+            st.markdown("### Next up")
+            for c in dash["next_recommended"]:
+                st.write(f"- **{c['title']}** ({c['difficulty']}, {c['duration_hours']}h)")
+    except requests.exceptions.HTTPError:
+        st.info("No path generated yet -- visit the Learning Path tab first.")
+
+
+# ---------------- Tab 4: Ask the assistant ----------------
+
+with tab_ask:
+    st.subheader("Ask questions about your learning path")
+    question = st.text_input("e.g. Why is course X before course Y? Can I skip the stats course?")
+    if st.button("Ask") and question:
+        with st.spinner("Thinking..."):
+            try:
+                result = api_post("/query", {
+                    "learner_id": st.session_state.learner_id,
+                    "question": question,
+                })
+                st.write(result["answer"])
+            except requests.exceptions.HTTPError as e:
+                st.error(f"Something went wrong: {e}")
