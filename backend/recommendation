@@ -1,0 +1,82 @@
+"""
+Recommendation engine.
+
+Uses TF-IDF vectorization + cosine similarity to match a learner's stated
+goal/interests against the course catalog's titles/descriptions/tags. This is
+a lightweight, dependency-light NLP technique (no model download required),
+chosen deliberately for a reproducible hackathon demo -- swap in
+sentence-transformers or an embeddings API for production use.
+
+Difficulty filtering ensures recommendations aren't wildly above the
+learner's current level, and completed courses are excluded.
+"""
+import json
+import os
+from typing import Any, Dict, List
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+DIFFICULTY_RANK = {"beginner": 0, "intermediate": 1, "advanced": 2}
+
+_COURSES_PATH = os.path.join(os.path.dirname(__file__), "data", "courses.json")
+
+
+def load_courses() -> List[Dict[str, Any]]:
+    with open(_COURSES_PATH, "r") as f:
+        return json.load(f)
+
+
+def _course_text(course: Dict[str, Any]) -> str:
+    return f"{course['title']} {course['description']} {' '.join(course['tags'])} {course['category']}"
+
+
+def recommend_courses(
+    learner_profile: Dict[str, Any],
+    top_k: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Returns a ranked list of {course, score} dicts, most relevant first.
+    """
+    courses = load_courses()
+    completed = set(learner_profile.get("completed_course_ids") or [])
+    candidates = [c for c in courses if c["id"] not in completed]
+
+    if not candidates:
+        return []
+
+    interests = learner_profile.get("interests") or []
+    goal = learner_profile.get("goal") or ""
+    query_text = f"{goal} {' '.join(interests)}".strip()
+
+    if not query_text:
+        # No signal yet -- fall back to beginner-friendly popular categories
+        ranked = sorted(candidates, key=lambda c: DIFFICULTY_RANK.get(c["difficulty"], 1))
+        return [{"course": c, "score": 0.0} for c in ranked[:top_k]]
+
+    corpus = [query_text] + [_course_text(c) for c in candidates]
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+    query_vec = tfidf_matrix[0:1]
+    course_vecs = tfidf_matrix[1:]
+    similarities = cosine_similarity(query_vec, course_vecs).flatten()
+
+    scored = list(zip(candidates, similarities))
+
+    # Soft penalty for courses far above the learner's level (keeps ranking sane,
+    # but doesn't hard-exclude, since an eager learner might want a stretch course).
+    exp_level = learner_profile.get("experience_level", "beginner")
+    exp_rank = DIFFICULTY_RANK.get(exp_level, 0)
+
+    def adjusted_score(course, sim):
+        gap = DIFFICULTY_RANK.get(course["difficulty"], 1) - exp_rank
+        penalty = 0.15 * max(0, gap)  # advanced course for a beginner loses score
+        return sim - penalty
+
+    scored.sort(key=lambda pair: adjusted_score(pair[0], pair[1]), reverse=True)
+
+    results = [
+        {"course": course, "score": round(float(sim), 4)}
+        for course, sim in scored[:top_k]
+    ]
+    return results
