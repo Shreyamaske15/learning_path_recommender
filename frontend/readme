@@ -1,0 +1,173 @@
+# AI-Powered Personalized Learning Path Recommender
+
+An intelligent learning assistant that turns a learner's natural-language goals into a
+structured, explainable, prerequisite-aware learning roadmap — with a conversational
+intake, an AI Q&A assistant, and a progress dashboard.
+
+## Problem Understanding
+
+Learners on large course platforms struggle less with *finding* content and more with
+*sequencing* it: what to learn first, what depends on what, and whether a course is
+actually relevant to their specific goal. This project builds a system that profiles a
+learner conversationally, ranks relevant courses using an NLP similarity model, expands
+that ranking into a prerequisite-correct roadmap, explains every recommendation in plain
+language, and tracks progress over time.
+
+## Architecture
+
+```
+┌─────────────────────┐        HTTP         ┌──────────────────────────┐
+│  Streamlit Frontend  │ ───────────────────▶ │      FastAPI Backend     │
+│  (chat, path view,   │ ◀─────────────────── │                          │
+│   dashboard)         │                       │  ┌────────────────────┐ │
+└─────────────────────┘                        │  │ Learner Profiling  │ │
+                                                │  │ (Claude API)       │ │
+                                                │  └────────────────────┘ │
+                                                │  ┌────────────────────┐ │
+                                                │  │ Recommendation      │ │
+                                                │  │ Engine (TF-IDF +     │ │
+                                                │  │ cosine similarity)   │ │
+                                                │  └────────────────────┘ │
+                                                │  ┌────────────────────┐ │
+                                                │  │ Path Generator       │ │
+                                                │  │ (prerequisite graph, │ │
+                                                │  │  topological depth)  │ │
+                                                │  └────────────────────┘ │
+                                                │  ┌────────────────────┐ │
+                                                │  │ Explainability &     │ │
+                                                │  │ Q&A (Claude API)     │ │
+                                                │  └────────────────────┘ │
+                                                │           │              │
+                                                │      SQLite (learners,   │
+                                                │      chat, progress)     │
+                                                └──────────────────────────┘
+```
+
+## AI/ML Techniques Used
+
+1. **Conversational profiling (LLM)** — Claude extracts structured fields (goal,
+   interests, experience level, weekly hours) from free-text conversation, updating the
+   learner profile turn by turn instead of relying on a rigid form.
+2. **Content-based recommendation (TF-IDF + cosine similarity)** — the learner's
+   goal/interests are vectorized against the course catalog's titles, descriptions, and
+   tags to produce a relevance ranking. This is intentionally lightweight (no model
+   download, fully reproducible offline) and is easy to swap for embeddings
+   (sentence-transformers or an embeddings API) for higher semantic accuracy.
+3. **Prerequisite-graph path generation** — recommended courses are expanded to include
+   any missing prerequisites, then grouped into milestones by graph depth (a topological
+   ordering), so a learner is never told to take an advanced course before its
+   foundations.
+4. **Grounded explanation generation (LLM)** — each recommendation can be explained by
+   Claude, grounded in the learner's actual stated goal/interests and the course
+   metadata (not a generic blurb).
+5. **Grounded Q&A (LLM)** — learners can ask free-form questions about their path, and
+   Claude answers using the actual generated roadmap as context.
+
+## Key Features
+
+- Natural-language conversational intake with incremental profile building
+- Content-based course recommendation with difficulty-aware ranking
+- Automatic prerequisite resolution and milestone-based roadmap generation
+- Per-course AI-generated explanations ("why was this recommended to me?")
+- Free-form AI assistant Q&A grounded in the learner's actual path
+- Progress tracking (not started / in progress / completed) per course
+- Visual dashboard: completion %, hours completed, skill development by category,
+  next recommended actions
+
+## Project Structure
+
+```
+learning_path_recommender/
+├── backend/
+│   ├── main.py              # FastAPI app & all API endpoints
+│   ├── models.py            # SQLAlchemy ORM models
+│   ├── schemas.py           # Pydantic request/response schemas
+│   ├── database.py          # SQLite engine/session setup
+│   ├── llm_service.py       # Claude API integration
+│   ├── recommendation.py    # TF-IDF recommendation engine
+│   ├── path_generator.py    # Prerequisite graph -> milestone roadmap
+│   └── data/courses.json    # Seed course catalog (35 courses, 10 categories)
+├── frontend/
+│   └── app.py                # Streamlit UI (chat, path, dashboard, Q&A)
+├── requirements.txt
+├── .env.example
+├── run.sh                    # Convenience script to launch both services
+└── README.md
+```
+
+## Setup & Execution
+
+### Prerequisites
+- Python 3.10+
+- An Anthropic API key ([console.anthropic.com](https://console.anthropic.com))
+
+### 1. Install dependencies
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Configure your API key
+
+```bash
+cp .env.example .env
+# then edit .env and set ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### 3. Run
+
+**Option A — one command:**
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+**Option B — two terminals (recommended for development):**
+```bash
+# Terminal 1
+cd backend
+export ANTHROPIC_API_KEY=sk-ant-...     # or rely on .env via python-dotenv
+uvicorn main:app --reload --port 8000
+
+# Terminal 2
+export API_BASE_URL=http://localhost:8000
+streamlit run frontend/app.py
+```
+
+Then open **http://localhost:8501** in your browser. The API docs (Swagger UI) are
+available at **http://localhost:8000/docs**.
+
+### 4. Try it
+
+1. Create a learner profile in the sidebar (name, experience level, weekly hours).
+2. In the **Chat & Profile** tab, describe your goal, e.g.:
+   *"I want to become a machine learning engineer in 6 months. I know some Python
+   but I'm new to ML and stats. I have about 8 hours a week."*
+3. Open the **Learning Path** tab and click "Generate / refresh path".
+4. Click "Why this course?" on any card to see a grounded AI explanation.
+5. Mark a few courses as in-progress/completed and check the **Dashboard** tab.
+6. Ask a question in **Ask the Assistant**, e.g. *"Can I skip the statistics course?"*
+
+## Challenges Faced
+
+- **Balancing relevance vs. prerequisite correctness** — a pure similarity ranking can
+  recommend an advanced course before its foundations; solved by expanding the
+  recommendation set with transitive prerequisites and ordering by graph depth before
+  presenting milestones.
+- **Keeping the LLM profile-extraction reliable** — free-text chat is unstructured;
+  solved by constraining Claude to return strict JSON with explicit null-handling for
+  unknown fields, and merging updates incrementally rather than overwriting the profile
+  each turn.
+- **Reproducibility for evaluation** — avoided large embedding-model downloads at
+  runtime (e.g. sentence-transformers weights) in favor of TF-IDF, so the app runs
+  fully offline aside from the Claude API calls themselves.
+
+## Notes for Evaluators
+
+- The course catalog (`backend/data/courses.json`) is a seed dataset of 35 courses
+  across 10 categories with realistic prerequisite chains, used to demonstrate the full
+  pipeline end-to-end. In production this would be backed by a live course catalog API.
+- All learner data is stored locally in `backend/learning_path.db` (SQLite, created
+  automatically on first run) — no external database setup required.
